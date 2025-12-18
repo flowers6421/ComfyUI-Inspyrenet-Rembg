@@ -1,17 +1,74 @@
+import time
+import sys
+
+# ============================================================================
+# DEBUG LOGGING - Track initialization and performance
+# ============================================================================
+DEBUG_PREFIX = "[Inspyrenet-Rembg-DEBUG]"
+_import_start_time = time.time()
+
+def debug_log(message, start_time=None):
+    """Print debug message with optional elapsed time."""
+    if start_time is not None:
+        elapsed = time.time() - start_time
+        print(f"{DEBUG_PREFIX} {message} (took {elapsed:.3f}s)", flush=True)
+    else:
+        print(f"{DEBUG_PREFIX} {message}", flush=True)
+
+debug_log("Starting imports...")
+
+# ============================================================================
+# IMPORTS WITH TIMING
+# ============================================================================
+_t = time.time()
 from PIL import Image
+debug_log("Imported PIL.Image", _t)
+
+_t = time.time()
 import torch
+debug_log(f"Imported torch (version: {torch.__version__}, CUDA available: {torch.cuda.is_available()})", _t)
+
+if torch.cuda.is_available():
+    debug_log(f"  CUDA device: {torch.cuda.get_device_name(0)}")
+    debug_log(f"  CUDA version: {torch.version.cuda}")
+
+_t = time.time()
 import numpy as np
-from transparent_background import Remover
+debug_log("Imported numpy", _t)
+
+_t = time.time()
 from tqdm import tqdm
+debug_log("Imported tqdm", _t)
+
+_t = time.time()
 import os
+debug_log("Imported os", _t)
+
+# Import transparent_background with detailed timing
+debug_log("Importing transparent_background (this may trigger dependency loading)...")
+_t = time.time()
+try:
+    from transparent_background import Remover
+    debug_log("Imported transparent_background.Remover", _t)
+except Exception as e:
+    debug_log(f"ERROR importing transparent_background: {e}", _t)
+    raise
+
+# Log total import time
+debug_log(f"All imports completed", _import_start_time)
 
 # Try to import folder_paths for ComfyUI integration
 try:
     import folder_paths
     COMFYUI_AVAILABLE = True
+    debug_log("folder_paths module available (ComfyUI environment detected)")
 except ImportError:
     COMFYUI_AVAILABLE = False
-    print("Warning: folder_paths module not found. Custom model directory support disabled.")
+    debug_log("folder_paths module not found (not in ComfyUI environment)")
+
+# Track if this is the first Remover instantiation
+_first_remover_init = True
+_first_process_call = True
 
 
 # Tensor to PIL
@@ -94,21 +151,68 @@ class InspyrenetRembg:
     CATEGORY = "image"
 
     def remove_background(self, image, torchscript_jit):
-        # Check for custom model path in ComfyUI models directory
-        custom_ckpt = get_model_path(mode="base")
+        global _first_remover_init, _first_process_call
 
+        total_start = time.time()
+        debug_log("=" * 60)
+        debug_log("InspyrenetRembg.remove_background() called")
+        debug_log(f"  torchscript_jit: {torchscript_jit}")
+        debug_log(f"  input images: {len(image)}")
+        debug_log(f"  first_remover_init: {_first_remover_init}")
+        debug_log(f"  first_process_call: {_first_process_call}")
+
+        # Check for custom model path in ComfyUI models directory
+        _t = time.time()
+        custom_ckpt = get_model_path(mode="base")
+        debug_log(f"get_model_path() returned: {custom_ckpt}", _t)
+
+        # Initialize Remover with detailed logging
+        debug_log("Initializing Remover...")
+        debug_log(f"  ckpt: {custom_ckpt}")
+        debug_log(f"  jit: {torchscript_jit != 'default'}")
+
+        _t = time.time()
         if (torchscript_jit == "default"):
             remover = Remover(ckpt=custom_ckpt) if custom_ckpt else Remover()
         else:
             remover = Remover(jit=True, ckpt=custom_ckpt) if custom_ckpt else Remover(jit=True)
+        debug_log("Remover initialized", _t)
+
+        if _first_remover_init:
+            debug_log("*** This was the FIRST Remover initialization ***")
+            _first_remover_init = False
+
+        # Log device info
+        debug_log(f"  Remover device: {remover.device}")
 
         img_list = []
-        for img in tqdm(image, "Inspyrenet Rembg"):
-            mid = remover.process(tensor2pil(img), type='rgba')
-            out =  pil2tensor(mid)
+        for idx, img in enumerate(tqdm(image, "Inspyrenet Rembg")):
+            _t = time.time()
+            pil_img = tensor2pil(img)
+            debug_log(f"  Image {idx}: tensor2pil conversion", _t) if idx == 0 else None
+
+            _t = time.time()
+            mid = remover.process(pil_img, type='rgba')
+            if idx == 0:
+                debug_log(f"  Image {idx}: remover.process() - FIRST IMAGE", _t)
+                if _first_process_call:
+                    debug_log("*** This was the FIRST process() call (may include CUDA kernel compilation) ***")
+                    _first_process_call = False
+
+            _t = time.time()
+            out = pil2tensor(mid)
+            debug_log(f"  Image {idx}: pil2tensor conversion", _t) if idx == 0 else None
+
             img_list.append(out)
+
+        _t = time.time()
         img_stack = torch.cat(img_list, dim=0)
         mask = img_stack[:, :, :, 3]
+        debug_log("Output tensor stacking completed", _t)
+
+        debug_log(f"remove_background() TOTAL TIME", total_start)
+        debug_log("=" * 60)
+
         return (img_stack, mask)
         
 class InspyrenetRembgAdvanced:
@@ -130,19 +234,67 @@ class InspyrenetRembgAdvanced:
     CATEGORY = "image"
 
     def remove_background(self, image, torchscript_jit, threshold):
-        # Check for custom model path in ComfyUI models directory
-        custom_ckpt = get_model_path(mode="base")
+        global _first_remover_init, _first_process_call
 
+        total_start = time.time()
+        debug_log("=" * 60)
+        debug_log("InspyrenetRembgAdvanced.remove_background() called")
+        debug_log(f"  torchscript_jit: {torchscript_jit}")
+        debug_log(f"  threshold: {threshold}")
+        debug_log(f"  input images: {len(image)}")
+        debug_log(f"  first_remover_init: {_first_remover_init}")
+        debug_log(f"  first_process_call: {_first_process_call}")
+
+        # Check for custom model path in ComfyUI models directory
+        _t = time.time()
+        custom_ckpt = get_model_path(mode="base")
+        debug_log(f"get_model_path() returned: {custom_ckpt}", _t)
+
+        # Initialize Remover with detailed logging
+        debug_log("Initializing Remover...")
+        debug_log(f"  ckpt: {custom_ckpt}")
+        debug_log(f"  jit: {torchscript_jit != 'default'}")
+
+        _t = time.time()
         if (torchscript_jit == "default"):
             remover = Remover(ckpt=custom_ckpt) if custom_ckpt else Remover()
         else:
             remover = Remover(jit=True, ckpt=custom_ckpt) if custom_ckpt else Remover(jit=True)
+        debug_log("Remover initialized", _t)
+
+        if _first_remover_init:
+            debug_log("*** This was the FIRST Remover initialization ***")
+            _first_remover_init = False
+
+        # Log device info
+        debug_log(f"  Remover device: {remover.device}")
 
         img_list = []
-        for img in tqdm(image, "Inspyrenet Rembg"):
-            mid = remover.process(tensor2pil(img), type='rgba', threshold=threshold)
-            out =  pil2tensor(mid)
+        for idx, img in enumerate(tqdm(image, "Inspyrenet Rembg")):
+            _t = time.time()
+            pil_img = tensor2pil(img)
+            debug_log(f"  Image {idx}: tensor2pil conversion", _t) if idx == 0 else None
+
+            _t = time.time()
+            mid = remover.process(pil_img, type='rgba', threshold=threshold)
+            if idx == 0:
+                debug_log(f"  Image {idx}: remover.process() - FIRST IMAGE", _t)
+                if _first_process_call:
+                    debug_log("*** This was the FIRST process() call (may include CUDA kernel compilation) ***")
+                    _first_process_call = False
+
+            _t = time.time()
+            out = pil2tensor(mid)
+            debug_log(f"  Image {idx}: pil2tensor conversion", _t) if idx == 0 else None
+
             img_list.append(out)
+
+        _t = time.time()
         img_stack = torch.cat(img_list, dim=0)
         mask = img_stack[:, :, :, 3]
+        debug_log("Output tensor stacking completed", _t)
+
+        debug_log(f"remove_background() TOTAL TIME", total_start)
+        debug_log("=" * 60)
+
         return (img_stack, mask)
