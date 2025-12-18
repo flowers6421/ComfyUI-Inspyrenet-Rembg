@@ -32,6 +32,11 @@ def get_model_path(mode="base"):
 
     Returns:
         str or None: Path to model checkpoint if found in ComfyUI models directory, None otherwise
+
+    Model download links:
+        base:         https://github.com/plemeri/transparent-background/releases/download/1.2.12/ckpt_base.pth
+        fast:         https://github.com/plemeri/transparent-background/releases/download/1.2.12/ckpt_fast.pth
+        base-nightly: https://github.com/plemeri/transparent-background/releases/download/1.2.12/ckpt_base_nightly.pth
     """
     if not COMFYUI_AVAILABLE:
         return None
@@ -40,7 +45,7 @@ def get_model_path(mode="base"):
     model_filenames = {
         "base": "ckpt_base.pth",
         "fast": "ckpt_fast.pth",
-        "base-nightly": "ckpt_base.pth"  # Uses same filename as base
+        "base-nightly": "ckpt_base_nightly.pth"
     }
 
     model_filename = model_filenames.get(mode, "ckpt_base.pth")
