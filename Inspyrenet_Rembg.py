@@ -46,6 +46,15 @@ debug_log("Imported os", _t)
 
 # Import transparent_background with detailed timing
 debug_log("Importing transparent_background (this may trigger dependency loading)...")
+
+_t = time.time()
+import albumentations
+debug_log("Imported albumentations", _t)
+
+_t = time.time()
+import timm
+debug_log(f"Imported timm (version: {timm.__version__})", _t)
+
 _t = time.time()
 try:
     from transparent_background import Remover
@@ -69,6 +78,107 @@ except ImportError:
 # Track if this is the first Remover instantiation
 _first_remover_init = True
 _first_process_call = True
+
+
+# ============================================================================
+# INSTRUMENTED REMOVER - Logs each step of initialization
+# ============================================================================
+def create_instrumented_remover(mode="base", jit=False, device=None, ckpt=None):
+    """
+    Create a Remover instance with detailed timing logs for each initialization step.
+    This helps identify exactly where the 67+ second delay is occurring.
+    """
+    import hashlib
+    from transparent_background.InSPyReNet import InSPyReNet_SwinB
+    from transparent_background.utils import load_config
+    import torch.nn.functional as F
+    import torchvision.transforms as transforms
+    import albumentations as A
+    import albumentations.pytorch as AP
+
+    debug_log("=" * 60)
+    debug_log("INSTRUMENTED REMOVER INITIALIZATION")
+    debug_log(f"  mode={mode}, jit={jit}, device={device}, ckpt={ckpt}")
+    total_start = time.time()
+
+    # Step 1: Load config
+    _t = time.time()
+    cfg_path = os.environ.get('TRANSPARENT_BACKGROUND_FILE_PATH', os.path.abspath(os.path.expanduser('~')))
+    home_dir = os.path.join(cfg_path, ".transparent-background")
+    os.makedirs(home_dir, exist_ok=True)
+
+    import shutil
+    repopath = os.path.dirname(os.path.abspath(__import__('transparent_background').__file__))
+    if not os.path.isfile(os.path.join(home_dir, "config.yaml")):
+        shutil.copy(os.path.join(repopath, "config.yaml"), os.path.join(home_dir, "config.yaml"))
+    meta = load_config(os.path.join(home_dir, "config.yaml"))[mode]
+    debug_log("Step 1: Config loaded", _t)
+
+    # Step 2: Determine device
+    _t = time.time()
+    if device is not None:
+        _device = device
+    else:
+        _device = "cpu"
+        if torch.cuda.is_available():
+            _device = "cuda:0"
+    debug_log(f"Step 2: Device determined: {_device}", _t)
+
+    # Step 3: Resolve checkpoint path
+    _t = time.time()
+    if ckpt is None:
+        ckpt_dir = home_dir
+        ckpt_name = meta.ckpt_name
+    else:
+        ckpt_dir, ckpt_name = os.path.split(os.path.abspath(ckpt))
+    ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+    ckpt_size = os.path.getsize(ckpt_path) / (1024 * 1024) if os.path.exists(ckpt_path) else 0
+    debug_log(f"Step 3: Checkpoint path resolved: {ckpt_path} ({ckpt_size:.2f} MB)", _t)
+
+    # Step 4: Create model architecture (THIS MIGHT BE SLOW)
+    _t = time.time()
+    debug_log("Step 4: Creating InSPyReNet_SwinB model architecture...")
+    model = InSPyReNet_SwinB(depth=64, pretrained=False, threshold=None, **meta)
+    debug_log("Step 4: Model architecture created", _t)
+
+    # Step 5: Set model to eval mode
+    _t = time.time()
+    model.eval()
+    debug_log("Step 5: Model set to eval mode", _t)
+
+    # Step 6: Load checkpoint weights
+    _t = time.time()
+    debug_log("Step 6: Loading checkpoint weights from disk...")
+    state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    debug_log("Step 6: Checkpoint loaded from disk", _t)
+
+    # Step 7: Load state dict into model
+    _t = time.time()
+    model.load_state_dict(state_dict, strict=True)
+    debug_log("Step 7: State dict loaded into model", _t)
+
+    # Step 8: Move model to GPU (THIS IS LIKELY THE SLOW STEP)
+    _t = time.time()
+    debug_log(f"Step 8: Moving model to {_device}...")
+    model = model.to(_device)
+    debug_log("Step 8: Model moved to device", _t)
+
+    # Step 9: CUDA synchronize to ensure transfer is complete
+    _t = time.time()
+    if 'cuda' in _device:
+        torch.cuda.synchronize()
+    debug_log("Step 9: CUDA synchronized", _t)
+
+    debug_log(f"INSTRUMENTED REMOVER TOTAL TIME", total_start)
+    debug_log("=" * 60)
+
+    # Now create the actual Remover with the pre-loaded model
+    # We'll use the standard Remover but it should be fast since model is cached
+    _t = time.time()
+    remover = Remover(mode=mode, jit=jit, device=device, ckpt=ckpt)
+    debug_log("Standard Remover created (should reuse cached model)", _t)
+
+    return remover
 
 
 # Tensor to PIL
@@ -166,16 +276,19 @@ class InspyrenetRembg:
         custom_ckpt = get_model_path(mode="base")
         debug_log(f"get_model_path() returned: {custom_ckpt}", _t)
 
-        # Initialize Remover with detailed logging
-        debug_log("Initializing Remover...")
-        debug_log(f"  ckpt: {custom_ckpt}")
-        debug_log(f"  jit: {torchscript_jit != 'default'}")
+        # Initialize Remover with INSTRUMENTED logging to find the bottleneck
+        use_jit = torchscript_jit != 'default'
 
         _t = time.time()
-        if (torchscript_jit == "default"):
-            remover = Remover(ckpt=custom_ckpt) if custom_ckpt else Remover()
+        if _first_remover_init:
+            # Use instrumented remover on first init to find where time is spent
+            remover = create_instrumented_remover(mode="base", jit=use_jit, ckpt=custom_ckpt)
         else:
-            remover = Remover(jit=True, ckpt=custom_ckpt) if custom_ckpt else Remover(jit=True)
+            # Use standard remover for subsequent calls
+            if use_jit:
+                remover = Remover(jit=True, ckpt=custom_ckpt) if custom_ckpt else Remover(jit=True)
+            else:
+                remover = Remover(ckpt=custom_ckpt) if custom_ckpt else Remover()
         debug_log("Remover initialized", _t)
 
         if _first_remover_init:
@@ -250,16 +363,19 @@ class InspyrenetRembgAdvanced:
         custom_ckpt = get_model_path(mode="base")
         debug_log(f"get_model_path() returned: {custom_ckpt}", _t)
 
-        # Initialize Remover with detailed logging
-        debug_log("Initializing Remover...")
-        debug_log(f"  ckpt: {custom_ckpt}")
-        debug_log(f"  jit: {torchscript_jit != 'default'}")
+        # Initialize Remover with INSTRUMENTED logging to find the bottleneck
+        use_jit = torchscript_jit != 'default'
 
         _t = time.time()
-        if (torchscript_jit == "default"):
-            remover = Remover(ckpt=custom_ckpt) if custom_ckpt else Remover()
+        if _first_remover_init:
+            # Use instrumented remover on first init to find where time is spent
+            remover = create_instrumented_remover(mode="base", jit=use_jit, ckpt=custom_ckpt)
         else:
-            remover = Remover(jit=True, ckpt=custom_ckpt) if custom_ckpt else Remover(jit=True)
+            # Use standard remover for subsequent calls
+            if use_jit:
+                remover = Remover(jit=True, ckpt=custom_ckpt) if custom_ckpt else Remover(jit=True)
+            else:
+                remover = Remover(ckpt=custom_ckpt) if custom_ckpt else Remover()
         debug_log("Remover initialized", _t)
 
         if _first_remover_init:
